@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""ir: control the IR devices set up in the Duoqin Remote app. See `ir help`."""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import kk  # noqa: E402
+
+APP = '/data/data/com.duoqin.remote'
+HOME = os.path.expanduser('~')
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or HOME + '/.cache', 'ir')
+STATE = os.path.join(os.environ.get('XDG_STATE_HOME') or HOME + '/.local/state', 'ir')
+CONFIG = os.path.join(os.environ.get('XDG_CONFIG_HOME') or HOME + '/.config', 'ir')
+COMMANDS = {'ls', 'sync', 'alias', 'help'}
+KEY_GAP = 0.25
+
+HELP = '''\
+usage: ir [device] [command...] [-n|--dry-run] [-j|--json] [-q|--quiet]
+
+devices are picked by number (ir ls), alias, or a unique prefix of either.
+with no arguments on a terminal, ir opens an fzf picker.
+
+  ir ls                       list devices and AC states
+  ir sync                     re-read devices from the Duoqin Remote app (needs sudo)
+  ir alias [dev name]         list aliases, or rename a device's alias
+
+ACs (anything you don't name keeps its last value; any setting also turns the AC on):
+  ir 2 on | off | toggle
+  ir 2 cool | heat | auto | dry | mode fan
+  ir 2 24                     temperature in °C, or 75f; +1 / -2 / up / down are relative
+  ir 2 fan auto|low|mid|high  also 0-3, wind/speed work too
+  ir 2 swing [on|off|next|N]  N is a fixed vane position
+  ir 2 cool 24 fan high       combine freely
+  ir 2 send                   resend the saved state
+  ir 2 status                 show the saved state (default when not on a terminal)
+
+other devices:
+  ir 1 keys                   list buttons
+  ir 1 power vol+ vol+        press buttons in order; vol+*5 presses five times
+
+  -n  print the IR pattern instead of sending (state is not saved)
+  -j  JSON output for ls and status
+  -q  no output on success
+'''
+
+
+class Usage(Exception):
+    pass
+
+
+class Fail(Exception):
+    pass
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+# devices
+
+def devices():
+    manifest = read_json(os.path.join(CACHE, 'devices.json'))
+    if manifest is None:
+        print('ir: first run, reading devices from the app', file=sys.stderr)
+        manifest = sync(quiet=True)
+    return manifest
+
+
+def aliases():
+    return {int(k): v for k, v in read_json(os.path.join(CONFIG, 'aliases.json'), {}).items()}
+
+
+def auto_alias(name, taken):
+    base = (re.findall(r'[a-z0-9]+', name.lower()) or ['dev'])[0]
+    if base.isdigit():
+        base = 'dev' + base
+    alias, n = base, 2
+    while alias in taken or alias in COMMANDS:
+        alias, n = f'{base}{n}', n + 1
+    return alias
+
+
+def resolve(arg, devs, names):
+    by_id = {d['id']: d for d in devs}
+    if arg.isdigit():
+        if int(arg) in by_id:
+            return by_id[int(arg)]
+        raise Usage(f'no device {arg} (see ir ls)')
+    arg = arg.lower()
+    for d in devs:
+        if names.get(d['id']) == arg:
+            return d
+    hits = [d for d in devs if names.get(d['id'], '').startswith(arg)]
+    if not hits:
+        hits = [d for d in devs if re.sub(r'[^a-z0-9]', '', d['name'].lower()).startswith(arg)]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise Usage(f'"{arg}" matches ' + ', '.join(names.get(d['id'], str(d['id'])) for d in hits))
+    raise Usage(f'no device "{arg}" (see ir ls)')
+
+
+def device_data(dev):
+    return read_json(os.path.join(CACHE, 'devices', f"{dev['id']}.json"))
+
+
+# sync
+
+def sync(quiet=False):
+    raw = os.path.join(CACHE, 'app')
+    new = raw + '.new'
+    shutil.rmtree(new, ignore_errors=True)
+    os.makedirs(new)
+    copy = (f'for f in {APP}/files/[0-9]*-*; do [ -e "$f" ] && cp "$f" {new}/; done; '
+            f'cp {APP}/databases/Remote.db {APP}/shared_prefs/Remote.xml {new}/ && chown -R {os.getuid()}:{os.getgid()} {new}')
+    res = subprocess.run(['sudo', 'sh', '-c', copy], capture_output=True, text=True)
+    if res.returncode:
+        raise Fail(f'could not copy from the Duoqin Remote app: {res.stderr.strip() or "sudo failed"}')
+
+    import hashlib
+    import html
+    import sqlite3
+    db = sqlite3.connect(os.path.join(new, 'Remote.db'))
+    rows = db.execute('select _id, device_name from Device order by _id').fetchall()
+    db.close()
+    prefs = open(os.path.join(new, 'Remote.xml')).read()
+    app_states = {int(m[1]): json.loads(html.unescape(m[2])) for m in re.finditer(r'name="AC_STATE_(\d+)">([^<]*)<', prefs)}
+
+    old = {d['id'] for d in read_json(os.path.join(CACHE, 'devices.json'), {'devices': []})['devices']}
+    names = aliases()
+    files = os.listdir(new)
+    devs = []
+    for dev_id, name in rows:
+        file = next((f for f in files if f.startswith(f'{dev_id}-')), None)
+        if not file:
+            print(f'ir: {name}: no code file in the app, open it there once and sync again', file=sys.stderr)
+            continue
+        data = kk.load(os.path.join(new, file))
+        is_ac = data['type'] == 2
+        write_json(os.path.join(CACHE, 'devices', f'{dev_id}.json'), data)
+        kind = 'AC' if is_ac else file.split('-', 1)[1].replace('_', ' ').lower()
+        dev = {'id': dev_id, 'name': name, 'kind': kind, 'ac': is_ac, 'freq': data['fre']}
+        devs.append(dev)
+        if is_ac:
+            ac = kk.AC(data, os.path.join(CACHE, 'work'))
+            table_path = os.path.join(CACHE, 'tables', f'{dev_id}.json')
+            # rebuild when the remote's codes or the encoder change
+            source = hashlib.sha1(json.dumps(data['exts'], sort_keys=True).encode() + open(kk.__file__, 'rb').read()).hexdigest()
+            table = read_json(table_path)
+            if not table or table.get('source') != source:
+                table = ac.build_table()
+                table['source'] = source
+                write_json(table_path, table)
+            if not os.path.exists(state_path(dev)):
+                save_state(dev, seed_state(ac, app_states.get(dev_id)))
+        if dev_id not in names:
+            names[dev_id] = auto_alias(name, set(names.values()))
+
+    ids = {d['id'] for d in devs}
+    names = {k: v for k, v in names.items() if k in ids}
+    write_json(os.path.join(CONFIG, 'aliases.json'), {str(k): v for k, v in names.items()})
+    for gone in old - ids:
+        for path in (os.path.join(CACHE, 'devices', f'{gone}.json'), os.path.join(CACHE, 'tables', f'{gone}.json')):
+            if os.path.exists(path):
+                os.remove(path)
+    manifest = {'devices': devs, 'synced': int(time.time())}
+    write_json(os.path.join(CACHE, 'devices.json'), manifest)
+    shutil.rmtree(raw, ignore_errors=True)
+    os.replace(new, raw)
+    if not quiet:
+        for d in devs:
+            tag = '  (new)' if d['id'] not in old else ''
+            print(f"{d['id']:>3}  {names[d['id']]:<12} {d['name']}{tag}")
+        for gone in sorted(old - ids):
+            print(f'{gone:>3}  removed')
+    return manifest
+
+
+# AC state
+
+def state_path(dev):
+    return os.path.join(STATE, f"{dev['id']}.json")
+
+
+def seed_state(ac, app=None):
+    """Start from the app's own saved state when there is one, else the app's defaults."""
+    lim = ac.limits
+    st = {'power': kk.POWER_OFF, 'mode': next(iter(lim.modes)),
+          'temp': {m: md.default_temp for m, md in lim.modes.items()},
+          'wind': {m: md.default_wind for m, md in lim.modes.items()},
+          'ud': lim.uds()[0]}
+    if app:
+        st['power'] = app.get('curPowerState', st['power'])
+        models = app.get('modelList', [])
+        if 0 <= app.get('curIndex', -1) < len(models) and models[app['curIndex']]['modelType'] in lim.modes:
+            st['mode'] = models[app['curIndex']]['modelType']
+        for ml in models:
+            md = lim.modes.get(ml['modelType'])
+            if md and ml['curTmp'] in md.temps:
+                st['temp'][md.mode] = ml['curTmp']
+            if md and ml['curWindSpeed'] in md.winds:
+                st['wind'][md.mode] = ml['curWindSpeed']
+        if app.get('curUDDirect') in lim.uds():
+            st['ud'] = app['curUDDirect']
+    return st
+
+
+def load_state(dev, ac):
+    st = read_json(state_path(dev)) or seed_state(ac)
+    st['temp'] = {int(k): v for k, v in st['temp'].items()}
+    st['wind'] = {int(k): v for k, v in st['wind'].items()}
+    return st
+
+
+def save_state(dev, st):
+    write_json(state_path(dev), st)
+
+
+def describe(st, ac):
+    mode = st['mode']
+    parts = ['on' if st['power'] == kk.POWER_ON else 'off', kk.MODES[mode]]
+    if st['temp'][mode] != -1:
+        parts.append(f"{st['temp'][mode]}°C")
+    if st['wind'][mode] != -1:
+        parts.append(f"fan {kk.WINDS[st['wind'][mode]]}")
+    if ac.limits.uds() != [-1]:
+        parts.append('swing' if st['ud'] == 0 else f"vane {st['ud']}")
+    return '  '.join(parts)
+
+
+def state_json(st):
+    mode = st['mode']
+    return {'power': st['power'] == kk.POWER_ON, 'mode': kk.MODES[mode],
+            'temp': None if st['temp'][mode] == -1 else st['temp'][mode],
+            'fan': None if st['wind'][mode] == -1 else kk.WINDS[st['wind'][mode]],
+            'swing': st['ud'] == 0, 'vane': st['ud'] if st['ud'] > 0 else None}
+
+
+def parse_wind(word):
+    word = word.lower()
+    if word in kk.WINDS:
+        return kk.WINDS.index(word)
+    if word in ('0', '1', '2', '3'):
+        return int(word)
+    return None
+
+
+TEMP = re.compile(r'^([+-]?)(\d+(?:\.\d+)?)([cf]?)°?$')
+
+
+def parse_temp(word):
+    """'24' -> ('abs', 24); '+2' -> ('rel', 2); '75f' -> ('abs', 24)"""
+    m = TEMP.match(word.lower())
+    if not m:
+        return None
+    sign, num, unit = m.groups()
+    value = float(num)
+    if sign:
+        value = value * 5 / 9 if unit == 'f' else value
+        return 'rel', round(-value if sign == '-' else value)
+    return 'abs', round((value - 32) * 5 / 9) if unit == 'f' else round(value)
+
+
+def apply_ac(args, st, ac):
+    """Returns (new state, functionId) for an AC command line."""
+    lim = ac.limits
+    want = {}
+    i = 0
+    while i < len(args):
+        a = args[i].lower()
+        nxt = args[i + 1].lower() if i + 1 < len(args) else None
+        if a in ('on', 'off'):
+            want['power'] = kk.POWER_ON if a == 'on' else kk.POWER_OFF
+        elif a == 'toggle':
+            want['power'] = kk.POWER_OFF if st['power'] == kk.POWER_ON else kk.POWER_ON
+        elif a in ('send', 'resend'):
+            want.setdefault('send', True)
+        elif a == 'mode':
+            if nxt not in kk.MODES:
+                raise Usage('mode needs one of: ' + ' '.join(kk.MODES))
+            want['mode'] = kk.MODES.index(nxt)
+            i += 1
+        elif a in ('fan', 'wind', 'speed') and nxt is not None and parse_wind(nxt) is not None:
+            want['wind'] = parse_wind(nxt)
+            i += 1
+        elif a in kk.MODES:
+            want['mode'] = kk.MODES.index(a)
+        elif a in ('wind', 'speed'):
+            raise Usage('fan speed needs one of: ' + ' '.join(kk.WINDS))
+        elif a == 'temp':
+            if nxt is None or parse_temp(nxt) is None:
+                raise Usage('temp needs a value like 24, 75f, +1')
+            want['temp'] = parse_temp(nxt)
+            i += 1
+        elif a in ('up', 'down'):
+            want['temp'] = ('rel', 1 if a == 'up' else -1)
+        elif parse_temp(a):
+            want['temp'] = parse_temp(a)
+        elif a in ('swing', 'vane', 'fix'):
+            if a == 'fix':
+                want['swing'] = 'off'
+            elif nxt in ('on', 'auto', 'off', 'fix', 'next') or (nxt or '').isdigit():
+                want['swing'] = 'off' if nxt == 'fix' else nxt
+                i += 1
+            else:
+                want['swing'] = 'on' if a == 'swing' else 'next'
+        else:
+            raise Usage(f'unknown AC command "{args[i]}" (see ir help)')
+        i += 1
+
+    new = {**st, 'temp': dict(st['temp']), 'wind': dict(st['wind'])}
+    if 'mode' in want:
+        if want['mode'] not in lim.modes:
+            raise Usage(f"this AC has no {kk.MODES[want['mode']]} mode")
+        new['mode'] = want['mode']
+    md = lim.modes[new['mode']]
+    name = kk.MODES[new['mode']]
+    if 'temp' in want:
+        if not md.temp_ok:
+            raise Usage(f'{name} mode has no temperature setting')
+        kind, value = want['temp']
+        if kind == 'rel':
+            value = min(max(new['temp'][md.mode] + value, md.temps[0]), md.temps[-1])
+        elif value not in md.temps:
+            raise Usage(f'{name} mode takes {md.temps[0]}-{md.temps[-1]}°C')
+        new['temp'][md.mode] = value
+    if 'wind' in want:
+        if not md.wind_ok:
+            raise Usage(f'{name} mode has no fan speed setting')
+        if want['wind'] not in md.winds:
+            raise Usage(f'{name} mode fan speeds: ' + ' '.join(kk.WINDS[w] for w in md.winds))
+        new['wind'][md.mode] = want['wind']
+    if 'swing' in want:
+        uds, how = lim.uds(), want['swing']
+        if uds == [-1]:
+            raise Usage('this AC only has a fixed swing setting')
+        fixed = [u for u in uds if u != 0]
+        if how == 'on':
+            if 0 not in uds:
+                raise Usage('this AC has no swing, only vane positions ' + ' '.join(map(str, fixed)))
+            new['ud'] = 0
+        elif how == 'off':
+            new['ud'] = st['ud'] if st['ud'] in fixed else fixed[0]
+        elif how == 'next':
+            new['ud'] = fixed[0] if st['ud'] not in fixed else fixed[(fixed.index(st['ud']) + 1) % len(fixed)]
+        else:
+            if int(how) not in fixed:
+                raise Usage('vane positions: ' + ' '.join(map(str, fixed)))
+            new['ud'] = int(how)
+    settings = {'mode', 'temp', 'wind', 'swing'} & want.keys()
+    if 'power' in want:
+        new['power'] = want['power']
+    elif settings:
+        new['power'] = kk.POWER_ON
+
+    # the button the app would report for this change
+    if new['power'] != st['power']:
+        func = kk.FUNC['power']
+    elif new['mode'] != st['mode']:
+        func = kk.FUNC['mode']
+    elif new['temp'][new['mode']] != st['temp'][new['mode']]:
+        func = kk.FUNC['temp_up'] if new['temp'][new['mode']] > st['temp'][new['mode']] else kk.FUNC['temp_down']
+    elif new['wind'][new['mode']] != st['wind'][new['mode']]:
+        func = kk.FUNC['wind']
+    elif new['ud'] != st['ud']:
+        func = kk.FUNC['swing'] if new['ud'] == 0 else kk.FUNC['fix']
+    elif 'power' in want:
+        func = kk.FUNC['power']
+    else:
+        func = -1
+    return new, func
+
+
+def ac_pattern(dev, ac, st, func):
+    table = read_json(os.path.join(CACHE, 'tables', f"{dev['id']}.json"))
+    mode = st['mode']
+    return ac.pattern((st['power'], mode, st['temp'][mode], st['wind'][mode], st['ud'], func), table)
+
+
+# sending
+
+def transmit(freq, pattern):
+    try:
+        res = subprocess.run(['termux-infrared-transmit', '-f', str(freq), ','.join(map(str, pattern))],
+                             capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        raise Fail('termux-infrared-transmit not found (pkg install termux-api, plus the Termux:API app)')
+    except subprocess.TimeoutExpired:
+        raise Fail('termux-infrared-transmit timed out (is the Termux:API app installed?)')
+    if res.returncode or res.stderr.strip():
+        raise Fail(f'IR transmit failed: {res.stderr.strip() or res.stdout.strip()}')
+
+
+# commands
+
+def cmd_ac(dev, args, opt):
+    ac = kk.AC(device_data(dev), os.path.join(CACHE, 'work'))
+    st = load_state(dev, ac)
+    if not args or args == ['status']:
+        if opt['json']:
+            print(json.dumps(state_json(st)))
+        else:
+            print(describe(st, ac))
+        return
+    new, func = apply_ac(args, st, ac)
+    pattern = ac_pattern(dev, ac, new, func)
+    if opt['dry']:
+        print(f"{dev['freq']} {','.join(map(str, pattern))}")
+        return
+    transmit(dev['freq'], pattern)
+    save_state(dev, new)
+    if opt['json']:
+        print(json.dumps(state_json(new)))
+    elif not opt['quiet']:
+        print(describe(new, ac))
+
+
+def find_key(word, keys):
+    w = word.lower()
+    by_name = {}
+    for fkey, k in keys.items():
+        for n in (fkey.lower(), k['fname'].lower(), fkey.lower().removeprefix('navigate_')):
+            by_name.setdefault(n, fkey)
+    if w in by_name:
+        return by_name[w]
+    hits = sorted({fk for n, fk in by_name.items() if n.startswith(w)})
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise Usage(f'"{word}" matches ' + ', '.join(hits))
+    raise Usage(f'no button "{word}" (see ir <device> keys)')
+
+
+def cmd_plain(dev, args, opt):
+    dv = kk.Plain(device_data(dev))
+    if not args:
+        args = ['keys']
+    if args in (['keys'], ['ls']):
+        if opt['json']:
+            print(json.dumps([{'key': k, 'label': v['fname']} for k, v in dv.keys.items()]))
+        else:
+            for k, v in dv.keys.items():
+                print(f"{k:<16} {v['fname']}" if v['fname'].lower() != k else k)
+        return
+    presses = []
+    for a in args:
+        word, _, count = a.partition('*')
+        if count and not count.isdigit():
+            raise Usage(f'bad repeat in "{a}", use key*3')
+        presses += [find_key(word, dv.keys)] * (int(count) if count else 1)
+    for n, key in enumerate(presses):
+        pattern = dv.pattern(key)
+        if opt['dry']:
+            print(f"{key} {dev['freq']} {','.join(map(str, pattern))}")
+            continue
+        if n:
+            time.sleep(KEY_GAP)
+        transmit(dev['freq'], pattern)
+    if not opt['dry'] and not opt['quiet'] and not opt['json']:
+        print(' '.join(presses))
+
+
+def ls_rows(manifest, names):
+    rows = []
+    for d in manifest['devices']:
+        status = ''
+        if d['ac']:
+            ac = kk.AC(device_data(d), os.path.join(CACHE, 'work'))
+            st = load_state(d, ac)
+            status = describe(st, ac)
+        rows.append((d, names.get(d['id'], ''), status))
+    return rows
+
+
+def cmd_ls(opt):
+    manifest, names = devices(), aliases()
+    rows = ls_rows(manifest, names)
+    if opt['json']:
+        out = []
+        for d, alias, _ in rows:
+            item = {'id': d['id'], 'alias': alias, 'name': d['name'], 'kind': d['kind']}
+            if d['ac']:
+                ac = kk.AC(device_data(d), os.path.join(CACHE, 'work'))
+                item['state'] = state_json(load_state(d, ac))
+            out.append(item)
+        print(json.dumps(out))
+        return
+    w = max((len(d['name']) for d, _, _ in rows), default=0)
+    for d, alias, status in rows:
+        print(f"{d['id']:>3}  {alias:<12} {d['name']:<{w}}  {d['kind']:<16} {status}".rstrip())
+
+
+def cmd_alias(args):
+    manifest, names = devices(), aliases()
+    if not args:
+        for d in manifest['devices']:
+            print(f"{d['id']:>3}  {names.get(d['id'], '')}")
+        return
+    if len(args) != 2:
+        raise Usage('usage: ir alias <device> <new-alias>')
+    dev = resolve(args[0], manifest['devices'], names)
+    new = args[1].lower()
+    if not re.fullmatch(r'[a-z][a-z0-9_-]*', new):
+        raise Usage('aliases start with a letter and use a-z 0-9 _ -')
+    if new in COMMANDS:
+        raise Usage(f'"{new}" is an ir command')
+    if any(v == new and k != dev['id'] for k, v in names.items()):
+        raise Usage(f'"{new}" is already taken')
+    names[dev['id']] = new
+    write_json(os.path.join(CONFIG, 'aliases.json'), {str(k): v for k, v in names.items()})
+    print(f"{dev['id']:>3}  {new}")
+
+
+# interactive (fzf)
+
+def fzf(lines, header, prompt):
+    """Returns the chosen line, or what was typed when nothing matched, or None on Esc."""
+    res = subprocess.run(['fzf', '--no-sort', '--layout=reverse', '--height=~60%', '--print-query',
+                          f'--header={header}', f'--prompt={prompt}> '],
+                         input='\n'.join(lines), stdout=subprocess.PIPE, text=True)
+    if res.returncode == 130:
+        return None
+    out = res.stdout.splitlines()
+    if len(out) > 1 and out[1]:
+        return out[1]
+    return out[0] if out and out[0] else None
+
+
+def ac_menu(st, ac):
+    lim = ac.limits
+    md = lim.modes[st['mode']]
+    items = ['off' if st['power'] == kk.POWER_ON else 'on']
+    if md.temp_ok:
+        items += ['up', 'down']
+    items += [('mode ' + m) for i, m in enumerate(kk.MODES) if i in lim.modes and i != st['mode']]
+    items += [f'fan {kk.WINDS[w]}' for w in md.winds if w != st['wind'][md.mode]]
+    uds = lim.uds()
+    if 0 in uds and st['ud'] != 0:
+        items.append('swing on')
+    items += [f'vane {u}' for u in uds if u > 0 and u != st['ud']]
+    if md.temp_ok:
+        items += [str(t) for t in md.temps if t != st['temp'][md.mode]]
+    return items
+
+
+def interactive(dev, names, opt):
+    label = names.get(dev['id'], str(dev['id']))
+    if dev['ac']:
+        ac = kk.AC(device_data(dev), os.path.join(CACHE, 'work'))
+        while True:
+            st = load_state(dev, ac)
+            choice = fzf(ac_menu(st, ac), f"{dev['name']}: {describe(st, ac)}", label)
+            if choice is None:
+                return
+            try:
+                cmd_ac(dev, choice.split(), {**opt, 'quiet': True})
+            except Usage as e:
+                print(f'ir: {e}', file=sys.stderr)
+                time.sleep(1.5)
+    else:
+        keys = kk.Plain(device_data(dev)).keys
+        lines = [f"{k:<16} {v['fname']}" for k, v in keys.items()]
+        while True:
+            choice = fzf(lines, f"{dev['name']}  (esc to quit)", label)
+            if choice is None:
+                return
+            try:
+                cmd_plain(dev, choice.split()[:1], {**opt, 'quiet': True})
+            except Usage as e:
+                print(f'ir: {e}', file=sys.stderr)
+                time.sleep(1.5)
+
+
+def pick_device(opt):
+    manifest, names = devices(), aliases()
+    rows = ls_rows(manifest, names)
+    lines = [f"{d['id']:>3}  {alias:<12} {d['name']}  {status}".rstrip() for d, alias, status in rows]
+    choice = fzf(lines, 'device', 'ir')
+    if choice is None:
+        return
+    dev = resolve(choice.split()[0], manifest['devices'], names)
+    interactive(dev, names, opt)
+
+
+def main(argv):
+    opt = {'dry': False, 'json': False, 'quiet': False}
+    args = []
+    for a in argv:
+        if a in ('-n', '--dry-run'):
+            opt['dry'] = True
+        elif a in ('-j', '--json'):
+            opt['json'] = True
+        elif a in ('-q', '--quiet'):
+            opt['quiet'] = True
+        elif a in ('-h', '--help'):
+            args = ['help']
+            break
+        else:
+            args.append(a)
+    tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    if not args:
+        if tty and not opt['json']:
+            return pick_device(opt)
+        return cmd_ls(opt)
+    cmd, rest = args[0], args[1:]
+    if cmd == 'help':
+        print(HELP, end='')
+    elif cmd == 'ls':
+        cmd_ls(opt)
+    elif cmd == 'sync':
+        sync(quiet=opt['quiet'])
+    elif cmd == 'alias':
+        cmd_alias(rest)
+    else:
+        manifest, names = devices(), aliases()
+        dev = resolve(cmd, manifest['devices'], names)
+        if not rest and tty and not opt['json']:
+            return interactive(dev, names, opt)
+        (cmd_ac if dev['ac'] else cmd_plain)(dev, rest, opt)
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except Usage as e:
+        print(f'ir: {e}', file=sys.stderr)
+        sys.exit(2)
+    except Fail as e:
+        print(f'ir: {e}', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
